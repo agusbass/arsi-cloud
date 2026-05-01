@@ -1,17 +1,16 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-import os, time, requests
-import sqlite3
-import asyncio
+import os, time, requests, sqlite3
+import random
 
 app = FastAPI()
 
 API_KEY = os.getenv("API_KEY")
 
 # ======================================================
-# 🧠 DATABASE (PERSISTENT CUBE LAYER)
+# 🧠 DATABASE (SCALABLE MEMORY LAYER)
 # ======================================================
-conn = sqlite3.connect("arsi.db", check_same_thread=False)
+conn = sqlite3.connect("arsi_rl.db", check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -19,32 +18,32 @@ CREATE TABLE IF NOT EXISTS logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     text TEXT,
     route TEXT,
-    cost REAL,
+    reward REAL,
     latency REAL,
+    cost REAL,
     timestamp REAL
 )
 """)
-
 conn.commit()
 
 # ======================================================
-# REQUEST MODEL
+# 🧠 RL POLICY (MULTI-ARMED BANDIT)
+# ======================================================
+routes = ["LIGHT", "MEDIUM", "HEAVY"]
+
+q_values = {
+    "LIGHT": 1.0,
+    "MEDIUM": 1.0,
+    "HEAVY": 1.0
+}
+
+alpha = 0.2  # learning rate
+
+# ======================================================
+# REQUEST
 # ======================================================
 class RequestBody(BaseModel):
     text: str
-
-# ======================================================
-# 🧠 GRID ROUTER
-# ======================================================
-def grid_router(text):
-    words = len(text.split())
-
-    if words <= 5:
-        return "LIGHT", 0.0005
-    elif words <= 20:
-        return "MEDIUM", 0.005
-    else:
-        return "HEAVY", 0.02
 
 # ======================================================
 # 🧠 AI CALL
@@ -64,87 +63,100 @@ def call_ai(text):
     return response.json()["choices"][0]["message"]["content"]
 
 # ======================================================
-# 🧠 NODE SYSTEM (ASYNC READY)
+# 🧠 NODE EXECUTION
 # ======================================================
-async def light_node(text):
-    return f"[LIGHT] {text}"
-
-async def medium_node(text):
-    return call_ai(text)
-
-async def heavy_node(text):
-    return call_ai(text)
-
-# ======================================================
-# 🧠 EXECUTOR (PARALLEL READY)
-# ======================================================
-async def execute(route, text):
+def execute(route, text):
 
     if route == "LIGHT":
-        return await light_node(text)
-
+        return f"[LIGHT] {text}"
     elif route == "MEDIUM":
-        return await medium_node(text)
-
+        return call_ai(text)
     else:
-        return await heavy_node(text)
+        return call_ai(text)
 
 # ======================================================
-# 🧠 SAVE TO DATABASE (CUBE PERSISTENT)
+# 🧠 RL ROUTER (EXPLORATION + EXPLOITATION)
 # ======================================================
-def save_log(text, route, cost, latency):
+def rl_router(text):
+
+    # exploration vs exploitation
+    if random.random() < 0.2:
+        return random.choice(routes)
+
+    # pilih Q-value tertinggi
+    return max(q_values, key=q_values.get)
+
+# ======================================================
+# 🧠 REWARD FUNCTION
+# ======================================================
+def compute_reward(latency, cost):
+
+    # semakin cepat & murah → reward tinggi
+    return 1 / (latency + 0.01) - cost
+
+# ======================================================
+# 🧠 UPDATE RL POLICY
+# ======================================================
+def update_policy(route, reward):
+
+    q_values[route] = q_values[route] + alpha * (reward - q_values[route])
+
+# ======================================================
+# 🧠 SAVE LOG
+# ======================================================
+def save_log(text, route, reward, latency, cost):
     cursor.execute("""
-        INSERT INTO logs (text, route, cost, latency, timestamp)
-        VALUES (?, ?, ?, ?, ?)
-    """, (text, route, cost, latency, time.time()))
+        INSERT INTO logs (text, route, reward, latency, cost, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (text, route, reward, latency, cost, time.time()))
     conn.commit()
 
 # ======================================================
 # 🚀 MAIN ENGINE
 # ======================================================
 @app.post("/ask")
-async def ask(req: RequestBody):
+def ask(req: RequestBody):
 
     start = time.time()
     text = req.text
 
-    # 🧠 ROUTING
-    route, cost = grid_router(text)
+    # 🧠 RL ROUTING
+    route = rl_router(text)
 
-    # 🧠 EXECUTE NODE
-    response = await execute(route, text)
+    # ⚙️ EXECUTION
+    response = execute(route, text)
 
     latency = round(time.time() - start, 4)
 
-    # 🧠 PERSISTENT CUBE
-    save_log(text, route, cost, latency)
+    cost = 0.02 if route == "HEAVY" else 0.005 if route == "MEDIUM" else 0.0005
+
+    reward = compute_reward(latency, cost)
+
+    # 🧠 LEARNING STEP
+    update_policy(route, reward)
+
+    # 🧠 STORE
+    save_log(text, route, reward, latency, cost)
 
     return {
         "input": text,
         "route": route,
         "response": response,
-        "cost": cost,
-        "latency": latency,
-        "status": "persistent"
+        "reward": reward,
+        "q_values": q_values
     }
 
 # ======================================================
-# 📊 SYSTEM DASHBOARD (REAL DATA)
+# 📊 SCALING DASHBOARD
 # ======================================================
-@app.get("/dashboard")
-def dashboard():
+@app.get("/system")
+def system():
 
     cursor.execute("SELECT COUNT(*) FROM logs")
     total = cursor.fetchone()[0]
 
-    cursor.execute("SELECT AVG(latency) FROM logs")
-    avg_latency = cursor.fetchone()[0]
-
-    cursor.execute("SELECT SUM(cost) FROM logs")
-    total_cost = cursor.fetchone()[0]
-
     return {
         "total_requests": total,
-        "avg_latency": avg_latency,
-        "total_cost": total_cost
+        "q_values": q_values,
+        "status": "scalable + learning enabled"
     }
