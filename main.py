@@ -1,51 +1,53 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import os, time, requests
-from collections import defaultdict
+import sqlite3
+import asyncio
 
 app = FastAPI()
 
 API_KEY = os.getenv("API_KEY")
 
 # ======================================================
-# 🧠 CUBE LAYER (STATE + METRICS + GRAPH MEMORY)
+# 🧠 DATABASE (PERSISTENT CUBE LAYER)
 # ======================================================
-cube = {
-    "metrics": {
-        "total": 0,
-        "light": 0,
-        "medium": 0,
-        "heavy": 0,
-        "cost": 0.0,
-        "latency_avg": 0.0
-    },
-    "graph": defaultdict(list)  # hubungan request → route
-}
+conn = sqlite3.connect("arsi.db", check_same_thread=False)
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT,
+    route TEXT,
+    cost REAL,
+    latency REAL,
+    timestamp REAL
+)
+""")
+
+conn.commit()
 
 # ======================================================
-# 🧠 RING LAYER (TIME DECAY MEMORY)
+# REQUEST MODEL
 # ======================================================
-ring_memory = []
-
-def decay_memory():
-    global ring_memory
-    now = time.time()
-    ring_memory = [m for m in ring_memory if now - m["t"] < 3600]  # 1 jam hidup
+class RequestBody(BaseModel):
+    text: str
 
 # ======================================================
-# 🧠 NODE LAYER (MULTI AGENT)
+# 🧠 GRID ROUTER
 # ======================================================
-def light_node(text):
-    return f"[LIGHT NODE] {text}"
+def grid_router(text):
+    words = len(text.split())
 
-def medium_node(text):
-    return call_ai(text)
-
-def heavy_node(text):
-    return call_ai(text)
+    if words <= 5:
+        return "LIGHT", 0.0005
+    elif words <= 20:
+        return "MEDIUM", 0.005
+    else:
+        return "HEAVY", 0.02
 
 # ======================================================
-# 🧠 AI CALL (EXTERNAL LLM)
+# 🧠 AI CALL
 # ======================================================
 def call_ai(text):
     response = requests.post(
@@ -62,99 +64,60 @@ def call_ai(text):
     return response.json()["choices"][0]["message"]["content"]
 
 # ======================================================
-# 🧠 GRID LAYER (ROUTING + COST + LEARNING)
+# 🧠 NODE SYSTEM (ASYNC READY)
 # ======================================================
-def grid_router(text):
+async def light_node(text):
+    return f"[LIGHT] {text}"
 
-    # cek ring memory (learning shortcut)
-    for m in ring_memory:
-        if m["text"] == text:
-            return m["route"]
+async def medium_node(text):
+    return call_ai(text)
 
-    words = len(text.split())
-
-    if words <= 5:
-        return "LIGHT"
-    elif words <= 20:
-        return "MEDIUM"
-    else:
-        return "HEAVY"
+async def heavy_node(text):
+    return call_ai(text)
 
 # ======================================================
-# 🧠 COST MODEL
+# 🧠 EXECUTOR (PARALLEL READY)
 # ======================================================
-def cost_model(route):
-    return {
-        "LIGHT": 0.0005,
-        "MEDIUM": 0.005,
-        "HEAVY": 0.02
-    }[route]
+async def execute(route, text):
 
-# ======================================================
-# 🧠 EXECUTION ENGINE
-# ======================================================
-def execute(route, text):
     if route == "LIGHT":
-        return light_node(text)
+        return await light_node(text)
+
     elif route == "MEDIUM":
-        return medium_node(text)
+        return await medium_node(text)
+
     else:
-        return heavy_node(text)
+        return await heavy_node(text)
 
 # ======================================================
-# 🧠 UPDATE CUBE
+# 🧠 SAVE TO DATABASE (CUBE PERSISTENT)
 # ======================================================
-def update_cube(route, cost, latency, text):
-    cube["metrics"]["total"] += 1
-    cube["metrics"][route.lower()] += 1
-    cube["metrics"]["cost"] += cost
-
-    n = cube["metrics"]["total"]
-    cube["metrics"]["latency_avg"] = (
-        (cube["metrics"]["latency_avg"] * (n - 1) + latency) / n
-    )
-
-    cube["graph"][route].append(text)
+def save_log(text, route, cost, latency):
+    cursor.execute("""
+        INSERT INTO logs (text, route, cost, latency, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+    """, (text, route, cost, latency, time.time()))
+    conn.commit()
 
 # ======================================================
-# 🧠 LEARNING RING SAVE
-# ======================================================
-def save_ring(text, route):
-    ring_memory.append({
-        "text": text,
-        "route": route,
-        "t": time.time()
-    })
-
-# ======================================================
-# REQUEST MODEL
-# ======================================================
-class RequestBody(BaseModel):
-    text: str
-
-# ======================================================
-# 🚀 MAIN ARSI ENGINE
+# 🚀 MAIN ENGINE
 # ======================================================
 @app.post("/ask")
-def ask(req: RequestBody):
+async def ask(req: RequestBody):
 
     start = time.time()
     text = req.text
 
-    decay_memory()
+    # 🧠 ROUTING
+    route, cost = grid_router(text)
 
-    # 🧠 GRID DECISION
-    route = grid_router(text)
-
-    # 🧠 NODE EXECUTION
-    response = execute(route, text)
+    # 🧠 EXECUTE NODE
+    response = await execute(route, text)
 
     latency = round(time.time() - start, 4)
-    cost = cost_model(route)
 
-    # 🧠 UPDATE SYSTEMS
-    update_cube(route, cost, latency, text)
-    save_ring(text, route)
+    # 🧠 PERSISTENT CUBE
+    save_log(text, route, cost, latency)
 
     return {
         "input": text,
@@ -162,15 +125,26 @@ def ask(req: RequestBody):
         "response": response,
         "cost": cost,
         "latency": latency,
-        "cube": cube["metrics"]
+        "status": "persistent"
     }
 
 # ======================================================
-# 📊 OBSERVABILITY ENDPOINT (ENTERPRISE VIEW)
+# 📊 SYSTEM DASHBOARD (REAL DATA)
 # ======================================================
-@app.get("/system")
-def system():
+@app.get("/dashboard")
+def dashboard():
+
+    cursor.execute("SELECT COUNT(*) FROM logs")
+    total = cursor.fetchone()[0]
+
+    cursor.execute("SELECT AVG(latency) FROM logs")
+    avg_latency = cursor.fetchone()[0]
+
+    cursor.execute("SELECT SUM(cost) FROM logs")
+    total_cost = cursor.fetchone()[0]
+
     return {
-        "cube": cube,
-        "ring_size": len(ring_memory)
+        "total_requests": total,
+        "avg_latency": avg_latency,
+        "total_cost": total_cost
     }
